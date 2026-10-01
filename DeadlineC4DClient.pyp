@@ -79,6 +79,102 @@ def GetC4DSubmissionDir():
     return json_out.replace( "\\", "/" )
 
 
+def install_slack_options(submitter):
+    """Extend the repository dialog while keeping this a single-file install."""
+    base = submitter.SubmitC4DToDeadlineDialog
+    if getattr(base, "_slack_options_installed", False):
+        return
+
+    class SlackSubmissionDialog(base):
+        _slack_options_installed = True
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.slack_choice_id = self.GetNextID()
+            self.slack_text_id = self.GetNextID()
+            self.slack_history = []
+            self.slack_settings_path = os.path.join(
+                self.DeadlineSettings, "c4d_slack_mentions.json")
+            try:
+                with open(self.slack_settings_path, encoding="utf-8") as stream:
+                    history = json.load(stream)
+                if isinstance(history, list):
+                    self.slack_history = list(dict.fromkeys(
+                        value.strip() for value in history
+                        if isinstance(value, str) and value.strip()
+                        and not any(ord(char) < 32 for char in value)))[:20]
+            except (OSError, ValueError):
+                pass
+
+        def AddTextBoxGroup(self, control_id, label):
+            super().AddTextBoxGroup(control_id, label)
+            # Insert inside the existing Job Description group.
+            if control_id == self.dialogIDs["DepartmentBoxID"]:
+                self.AddComboBoxGroup(self.slack_choice_id, "Slack notification")
+                self.AddChild(self.slack_choice_id, 0, "None")
+                self.AddChild(self.slack_choice_id, 1, "Custom...")
+                for index, mention in enumerate(self.slack_history, 2):
+                    self.AddChild(self.slack_choice_id, index, mention)
+                super().AddTextBoxGroup(self.slack_text_id, "Slack @ person")
+
+        def InitValues(self):
+            result = super().InitValues()
+            # Deliberately opt in for each submission dialog.
+            self.SetLong(self.slack_choice_id, 0)
+            self.SetString(self.slack_text_id, "")
+            self.Enable(self.slack_text_id, False)
+            return result
+
+        def Command(self, control_id, message):
+            if control_id == self.slack_choice_id:
+                choice = self.GetLong(self.slack_choice_id)
+                mention = ""
+                if 2 <= choice < len(self.slack_history) + 2:
+                    mention = self.slack_history[choice - 2]
+                self.SetString(self.slack_text_id, mention)
+                self.Enable(self.slack_text_id, choice != 0)
+                return True
+            if control_id == self.dialogIDs["SubmitButtonID"]:
+                try:
+                    self.slack_mention()
+                except ValueError as error:
+                    c4d.gui.MessageDialog(str(error))
+                    return True
+            return super().Command(control_id, message)
+
+        def slack_mention(self):
+            if self.GetLong(self.slack_choice_id) == 0:
+                return ""
+            raw = self.GetString(self.slack_text_id)
+            if any(ord(char) < 32 for char in raw):
+                raise ValueError("Enter the Slack person on a single line.")
+            mention = raw.strip()
+            if not mention:
+                raise ValueError("Enter a Slack person, or choose None.")
+            return mention
+
+        def writeInfoFile(self, filename, fileContents):
+            # Job files carry Plugin; plugin-info files do not.
+            mention = self.slack_mention() if "Plugin" in fileContents else ""
+            if mention:
+                fileContents = dict(fileContents)
+                fileContents["OverrideTaskExtraInfoNames"] = "True"
+                fileContents["TaskExtraInfoName0"] = mention
+            result = super().writeInfoFile(filename, fileContents)
+            if mention:
+                history = [mention] + [value for value in self.slack_history
+                                       if value != mention]
+                try:
+                    os.makedirs(self.DeadlineSettings, exist_ok=True)
+                    with open(self.slack_settings_path, "w", encoding="utf-8") as stream:
+                        json.dump(history[:20], stream, ensure_ascii=False, indent=2)
+                except OSError as error:
+                    logging.warning("Could not save Slack mention history: %s", error)
+            return result
+
+    submitter.SubmitC4DToDeadlineDialog = SlackSubmissionDialog
+
+
 def main():
     # Get the repository path
     try:
@@ -99,6 +195,7 @@ def main():
         print("Error: Failed to import Deadline: %s" % e)
         raise
     
+    install_slack_options(SubmitC4DToDeadline)
     SubmitC4DToDeadline.main( submissionDir )
 
 
